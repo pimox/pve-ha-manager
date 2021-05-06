@@ -90,3 +90,5 @@ clean:
 .PHONY: distclean
 distclean: clean
 
+pve-ha-crm.8 pve-ha-lrm.8:
+	echo "fake" > $@

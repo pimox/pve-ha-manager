@@ -1,3 +1,9 @@
+pve-ha-manager (3.1-1rpve1) pve; urgency=medium
+
+  * Fake pve-ha-lrm.8 pve-ha-crm.8
+
+ -- Tim <tim.j.wilkinson@gmail.com>  Wed, 05 May 2021 12:29:16 -0700
+
 pve-ha-manager (3.1-1) pve; urgency=medium
 
   * allow 'with-local-disks' migration for replicated guests
