@@ -57,8 +57,9 @@ sub get_service_group {
     }
 
     # overwrite default if service is bound to a specific group
-    $group =  $groups->{ids}->{$service_conf->{group}} if $service_conf->{group} &&
-	$groups->{ids}->{$service_conf->{group}};
+    if (my $group_id = $service_conf->{group}) {
+	$group = $groups->{ids}->{$group_id} if $groups->{ids}->{$group_id};
+    }
 
     return $group;
 }
@@ -165,6 +166,7 @@ my $valid_service_states = {
     request_stop => 1,
     started => 1,
     fence => 1,
+    recovery => 1,
     migrate => 1,
     relocate => 1,
     freeze => 1,
@@ -186,8 +188,10 @@ sub recompute_online_node_usage {
 	my $sd = $self->{ss}->{$sid};
 	my $state = $sd->{state};
 	if (defined($online_node_usage->{$sd->{node}})) {
-	    if (($state eq 'started') || ($state eq 'request_stop') ||
-		($state eq 'fence') || ($state eq 'freeze') || ($state eq 'error')) {
+	    if (
+		$state eq 'started' || $state eq 'request_stop' || $state eq 'fence' ||
+		$state eq 'freeze' || $state eq 'error' || $state eq 'recovery'
+	    ) {
 		$online_node_usage->{$sd->{node}}++;
 	    } elsif (($state eq 'migrate') || ($state eq 'relocate')) {
 		# count it for both, source and target as load is put on both
@@ -196,7 +200,7 @@ sub recompute_online_node_usage {
 	    } elsif ($state eq 'stopped') {
 		# do nothing
 	    } else {
-		die "should not be reached";
+		die "should not be reached (sid = '$sid', state = '$state')";
 	    }
 	}
     }
@@ -258,53 +262,20 @@ my $fence_recovery_cleanup = sub {
 
     # locks may block recovery, cleanup those which are safe to remove after fencing,
     # i.e., after the original node was reset and thus all it's state
-    my $removable_locks = ['backup', 'mounted', 'migrate', 'clone', 'rollback', 'snapshot', 'snapshot-delete', 'suspending', 'suspended'];
+    my $removable_locks = [
+	'backup',
+	'mounted',
+	'migrate',
+	'clone',
+	'rollback',
+	'snapshot',
+	'snapshot-delete',
+	'suspending',
+	'suspended',
+    ];
     if (my $removed_lock = $plugin->remove_locks($haenv, $id, $removable_locks, $fenced_node)) {
 	$haenv->log('warning', "removed leftover lock '$removed_lock' from recovered " .
 	            "service '$sid' to allow its start.");
-    }
-};
-
-# after a node was fenced this recovers the service to a new node
-my $recover_fenced_service = sub {
-    my ($self, $sid, $cd) = @_;
-
-    my ($haenv, $ss) = ($self->{haenv}, $self->{ss});
-
-    my $sd = $ss->{$sid};
-
-    if ($sd->{state} ne 'fence') { # should not happen
-	$haenv->log('err', "cannot recover service '$sid' from fencing," .
-		    " wrong state '$sd->{state}'");
-	return;
-    }
-
-    my $fenced_node = $sd->{node}; # for logging purpose
-
-    $self->recompute_online_node_usage(); # we want the most current node state
-
-    my $recovery_node = select_service_node($self->{groups},
-					    $self->{online_node_usage},
-					    $cd, $sd->{node});
-
-    if ($recovery_node) {
-	$haenv->log('info', "recover service '$sid' from fenced node " .
-		    "'$fenced_node' to node '$recovery_node'");
-
-	&$fence_recovery_cleanup($self, $sid, $fenced_node);
-
-	$haenv->steal_service($sid, $sd->{node}, $recovery_node);
-	$self->{online_node_usage}->{$recovery_node}++;
-
-	# $sd *is normally read-only*, fencing is the exception
-	$cd->{node} = $sd->{node} = $recovery_node;
-	my $new_state = ($cd->{state} eq 'started') ? 'started' : 'request_stop';
-	&$change_service_state($self, $sid, $new_state, node => $recovery_node);
-    } else {
-	# no possible node found, cannot recover
-	$haenv->log('err', "recovering service '$sid' from fenced node " .
-		    "'$fenced_node' failed, no recovery node found");
-	&$change_service_state($self, $sid, 'error');
     }
 };
 
@@ -325,7 +296,6 @@ sub read_lrm_status {
 	    $results->{$uid} = $lrm_status->{results}->{$uid};
 	}
     }
-
 
     return ($results, $modes);
 }
@@ -449,6 +419,10 @@ sub manage {
 
 		# do nothing here - wait until fenced
 
+	    } elsif ($last_state eq 'recovery') {
+
+		$self->next_state_recovery($sid, $cd, $sd, $lrm_res);
+
 	    } elsif ($last_state eq 'request_stop') {
 
 		$self->next_state_request_stop($sid, $cd, $sd, $lrm_res);
@@ -494,7 +468,8 @@ sub manage {
 	    next if !$fenced_nodes->{$sd->{node}};
 
 	    # node fence was successful - recover service
-	    &$recover_fenced_service($self, $sid, $sc->{$sid});
+	    $change_service_state->($self, $sid, 'recovery');
+	    $repeat = 1; # for faster execution
 	}
 
 	last if !$repeat;
@@ -808,6 +783,60 @@ sub next_state_error {
 	return;
     }
 
+}
+
+# after a node was fenced this recovers the service to a new node
+sub next_state_recovery {
+    my ($self, $sid, $cd, $sd, $lrm_res) = @_;
+
+    my ($haenv, $ss) = ($self->{haenv}, $self->{ss});
+    my $ns = $self->{ns};
+    my $ms = $self->{ms};
+
+    if ($sd->{state} ne 'recovery') { # should not happen
+	$haenv->log('err', "cannot recover service '$sid' from fencing, wrong state '$sd->{state}'");
+	return;
+    }
+
+    my $fenced_node = $sd->{node}; # for logging purpose
+
+    $self->recompute_online_node_usage(); # we want the most current node state
+
+    my $recovery_node = select_service_node(
+	$self->{groups},
+	$self->{online_node_usage},
+	$cd,
+	$sd->{node},
+    );
+
+    if ($recovery_node) {
+	my $msg = "recover service '$sid' from fenced node '$fenced_node' to node '$recovery_node'";
+	if ($recovery_node eq $fenced_node) {
+	    # can happen if restriced groups and the node came up again OK
+	    $msg = "recover service '$sid' to previous failed and fenced node '$fenced_node' again";
+	}
+	$haenv->log('info', "$msg");
+
+	$fence_recovery_cleanup->($self, $sid, $fenced_node);
+
+	$haenv->steal_service($sid, $sd->{node}, $recovery_node);
+	$self->{online_node_usage}->{$recovery_node}++;
+
+	# NOTE: $sd *is normally read-only*, fencing is the exception
+	$cd->{node} = $sd->{node} = $recovery_node;
+	my $new_state = ($cd->{state} eq 'started') ? 'started' : 'request_stop';
+	$change_service_state->($self, $sid, $new_state, node => $recovery_node);
+    } else {
+	# no possible node found, cannot recover - but retry later, as we always try to make it available
+	$haenv->log('err', "recovering service '$sid' from fenced node '$fenced_node' failed, no recovery node found");
+
+	if ($cd->{state} eq 'disabled') {
+	    # allow getting a service out of recovery manually if an admin disables it.
+	    delete $sd->{failed_nodes}; # clean up on recovery to stopped
+	    $change_service_state->($self, $sid, 'stopped'); # must NOT go through request_stop
+	    return;
+	}
+    }
 }
 
 1;

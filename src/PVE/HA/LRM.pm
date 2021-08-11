@@ -20,6 +20,10 @@ my $valid_states = {
     lost_agent_lock => "lost agent_lock",
 };
 
+# we sleep ~10s per 'active' round, so if no services is available for >= 10 min we'd go in wait
+# state givining up the watchdog and the LRM lock acquire voluntary, ensuring the WD can do no harm
+my $max_active_idle_rounds = 60;
+
 sub new {
     my ($this, $haenv) = @_;
 
@@ -36,6 +40,7 @@ sub new {
 	# mode can be: active, reboot, shutdown, restart
 	mode => 'active',
 	cluster_state_update => 0,
+	active_idle_rounds => 0,
     }, $class;
 
     $self->set_local_status({ state => 	'wait_for_agent_lock' });
@@ -216,17 +221,32 @@ sub get_protected_ha_agent_lock {
     return 0;
 }
 
+# only cares if any service has the local node as their node, independent of which req.state it is
+sub has_configured_service_on_local_node {
+    my ($self) = @_;
+
+    my $haenv = $self->{haenv};
+    my $nodename = $haenv->nodename();
+
+    my $ss = $self->{service_status};
+    foreach my $sid (keys %$ss) {
+	my $sd = $ss->{$sid};
+	next if !$sd->{node} || $sd->{node} ne $nodename;
+
+	return 1;
+    }
+    return 0;
+}
+
 sub active_service_count {
     my ($self) = @_;
 
     my $haenv = $self->{haenv};
-
     my $nodename = $haenv->nodename();
 
     my $ss = $self->{service_status};
 
     my $count = 0;
-
     foreach my $sid (keys %$ss) {
 	my $sd = $ss->{$sid};
 	next if !$sd->{node};
@@ -234,6 +254,7 @@ sub active_service_count {
 	my $req_state = $sd->{state};
 	next if !defined($req_state);
 	next if $req_state eq 'stopped';
+	# NOTE: 'ignored' ones are already dropped by the manager from service_status
 	next if $req_state eq 'freeze';
 	# erroneous services are not managed by HA, don't count them as active
 	next if $req_state eq 'error';
@@ -260,6 +281,17 @@ sub do_one_iteration {
     $haenv->loop_end_hook();
 
     return $res;
+}
+
+# NOTE: this is disabling the self-fence mechanism, so it must NOT be called with active services
+# It's normally *only* OK on graceful shutdown (with no services, or all services frozen)
+my sub give_up_watchdog_protection {
+    my ($self) = @_;
+
+    if ($self->{ha_agent_wd}) {
+	$self->{haenv}->watchdog_close($self->{ha_agent_wd});
+	delete $self->{ha_agent_wd}; # only delete after close!
+    }
 }
 
 sub work {
@@ -315,6 +347,21 @@ sub work {
 	    $self->set_local_status({ state => 'lost_agent_lock'});
 	} elsif ($self->{mode} eq 'maintenance') {
 	    $self->set_local_status({ state => 'maintenance'});
+	} else {
+	    if (!$self->has_configured_service_on_local_node() && !$self->run_workers()) {
+		# no active service configured for this node and all (old) workers are done
+		$self->{active_idle_rounds}++;
+		if ($self->{active_idle_rounds} > $max_active_idle_rounds) {
+		    $haenv->log('info', "node had no service configured for $max_active_idle_rounds rounds, going idle.\n");
+		    # safety: no active service & no running worker for quite some time -> OK
+		    $haenv->release_ha_agent_lock();
+		    give_up_watchdog_protection($self);
+		    $self->set_local_status({ state => 'wait_for_agent_lock'});
+		    $self->{active_idle_rounds} = 0;
+		}
+	    } elsif ($self->{active_idle_rounds}) {
+		$self->{active_idle_rounds} = 0;
+	    }
 	}
     } elsif ($state eq 'maintenance') {
 
@@ -362,13 +409,9 @@ sub work {
 		    my $service_count = $self->active_service_count();
 
 		    if ($service_count == 0) {
-
 			if ($self->run_workers() == 0) {
-			    if ($self->{ha_agent_wd}) {
-				$haenv->watchdog_close($self->{ha_agent_wd});
-				delete $self->{ha_agent_wd};
-			    }
-
+			    # safety: no active services or workers -> OK
+			    give_up_watchdog_protection($self);
 			    $shutdown = 1;
 
 			    # restart with no or freezed services, release the lock
@@ -379,10 +422,8 @@ sub work {
 
 		    if ($self->run_workers() == 0) {
 			if ($self->{shutdown_errors} == 0) {
-			    if ($self->{ha_agent_wd}) {
-				$haenv->watchdog_close($self->{ha_agent_wd});
-				delete $self->{ha_agent_wd};
-			    }
+			    # safety: no active services and LRM shutdown -> OK
+			    give_up_watchdog_protection($self);
 
 			    # shutdown with all services stopped thus release the lock
 			    $haenv->release_ha_agent_lock();
@@ -416,10 +457,8 @@ sub work {
 
     } elsif ($state eq 'lost_agent_lock') {
 
-	# Note: watchdog is active an will triger soon!
-
+	# NOTE: watchdog is active an will trigger soon!
 	# so we hope to get the lock back soon!
-
 	if ($self->{shutdown_request}) {
 
 	    my $service_count = $self->active_service_count();
@@ -441,13 +480,8 @@ sub work {
 		    }
 		}
 	    } else {
-
-		# all services are stopped, so we can close the watchdog
-
-		if ($self->{ha_agent_wd}) {
-		    $haenv->watchdog_close($self->{ha_agent_wd});
-		    delete $self->{ha_agent_wd};
-		}
+		# safety: all services are stopped, so we can close the watchdog
+		give_up_watchdog_protection($self);
 
 		return 0;
 	    }
@@ -467,10 +501,8 @@ sub work {
 
 	if ($self->{shutdown_request}) {
 	    if ($service_count == 0 && $self->run_workers() == 0) {
-		if ($self->{ha_agent_wd}) {
-		    $haenv->watchdog_close($self->{ha_agent_wd});
-		    delete $self->{ha_agent_wd};
-		}
+		# safety: going into maintenance and all active services got moved -> OK
+		give_up_watchdog_protection($self);
 
 		$exit_lrm = 1;
 
@@ -586,8 +618,16 @@ sub manage_resources {
 	next if $sd->{node} ne $nodename;
 	my $req_state = $sd->{state};
 	next if !defined($req_state);
+	# can only happen for restricted groups where the failed node itself needs to be the
+	# reocvery target. Always let the master first do so, it will then marked as 'stopped' and
+	# we can just continue normally. But we must NOT do anything with it while still in recovery
+	next if $req_state eq 'recovery';
 	next if $req_state eq 'freeze';
-	$self->queue_resource_command($sid, $sd->{uid}, $req_state, {'target' => $sd->{target}, 'timeout' => $sd->{timeout}});
+
+	$self->queue_resource_command($sid, $sd->{uid}, $req_state, {
+	    'target' => $sd->{target},
+	    'timeout' => $sd->{timeout},
+	});
     }
 
     return $self->run_workers();
@@ -788,7 +828,6 @@ sub exec_resource_agent {
 
     # process error state early
     if ($cmd eq 'error') {
-
 	$haenv->log('err', "service $sid is in an error state and needs manual " .
 		    "intervention. Look up 'ERROR RECOVERY' in the documentation.");
 

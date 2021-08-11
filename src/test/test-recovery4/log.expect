@@ -40,24 +40,21 @@ err     240    node1/crm: recovering service 'vm:102' from fenced node 'node2' f
 err     260    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
 err     280    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
 err     300    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
+info    320      cmdlist: execute service vm:102 migrate node3
+info    320    node1/crm: got crm command: migrate vm:102 node3
 err     320    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
 err     340    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
 err     360    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
 err     380    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
 err     400    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
+info    420      cmdlist: execute service vm:102 stop 5
+info    420    node1/crm: got crm command: stop vm:102 5
 err     420    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
 err     440    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
 err     460    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
 err     480    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
 err     500    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
+info    520      cmdlist: execute service vm:102 disabled
 err     520    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
-err     540    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
-err     560    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
-err     580    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
-err     600    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
-err     620    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
-err     640    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
-err     660    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
-err     680    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
-err     700    node1/crm: recovering service 'vm:102' from fenced node 'node2' failed, no recovery node found
-info    720     hardware: exit simulation - done
+info    520    node1/crm: service 'vm:102': state changed from 'recovery' to 'stopped'
+info   1120     hardware: exit simulation - done
